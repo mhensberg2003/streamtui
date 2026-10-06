@@ -643,15 +643,36 @@ async fn prepare(torbox: Torbox, tx: UnboundedSender<Job>, hash: String, uri: St
     }
 }
 
-/// macOS only, so `pbpaste` is the whole clipboard story.
-pub fn read_clipboard() -> Option<String> {
-    let output = std::process::Command::new("pbpaste").output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if magnet::looks_like_magnet(&text) {
-        Some(text)
-    } else {
-        None
+/// Clipboard readers to try, in order. A reader that is not installed, or that
+/// has no display to talk to, fails and the next one is tried.
+fn clipboard_readers(wayland: bool) -> Vec<&'static [&'static str]> {
+    if cfg!(target_os = "macos") {
+        return vec![&["pbpaste"]];
     }
+    let mut readers: Vec<&'static [&'static str]> = Vec::new();
+    if wayland {
+        readers.push(&["wl-paste", "--no-newline"]);
+    }
+    readers.push(&["xclip", "-o", "-selection", "clipboard"]);
+    readers.push(&["xsel", "--clipboard", "--output"]);
+    readers
+}
+
+pub fn read_clipboard() -> Option<String> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    clipboard_readers(wayland).into_iter().find_map(|reader| {
+        let output = std::process::Command::new(reader[0])
+            .args(&reader[1..])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        magnet::looks_like_magnet(&text).then_some(text)
+    })
 }
 
 pub fn spawn_key_reader(tx: UnboundedSender<Input>) -> Result<()> {
@@ -677,6 +698,22 @@ mod tests {
     use super::*;
 
     pub(super) const GB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_reads_the_clipboard_with_pbpaste() {
+        assert_eq!(clipboard_readers(false), vec![&["pbpaste"][..]]);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_tries_wayland_first_then_x11() {
+        let names = |wayland| {
+            clipboard_readers(wayland).iter().map(|r| r[0]).collect::<Vec<_>>()
+        };
+        assert_eq!(names(true), vec!["wl-paste", "xclip", "xsel"]);
+        assert_eq!(names(false), vec!["xclip", "xsel"]);
+    }
 
     pub(super) async fn test_app() -> App {
         let torbox = Torbox::new("test-key".into()).unwrap();

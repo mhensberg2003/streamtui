@@ -1,6 +1,6 @@
 # streamtui
 
-Paste a magnet link, pick a file, watch it in mpv. macOS.
+Paste a magnet link, pick a file, watch it in mpv. macOS and Linux.
 
 TorBox is the only backend — there is no BitTorrent protocol code here.
 The flow is `checkcached` → `createtorrent` → `requestdl`, with a localhost
@@ -8,19 +8,35 @@ proxy in front of the CDN so the API key never reaches mpv.
 
 ## Requirements
 
-- macOS
+- macOS or Linux
 - [Rust](https://rustup.rs) 1.85 or later (the crate uses edition 2024)
 - [mpv](https://mpv.io) on `PATH`
 - A [TorBox](https://torbox.app) API key (Settings → API Key)
+- Linux only, for clipboard paste: `wl-clipboard` (Wayland), or `xclip` or
+  `xsel` (X11). Without one, paste the magnet with your terminal's own paste
+  key, or pass it as an argument.
 
 ## Install
 
-1. Install Rust and mpv:
+1. Install Rust, mpv and (on Linux) a C compiler and a clipboard tool.
+
+   macOS:
 
    ```sh
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    brew install mpv
    ```
+
+   Arch Linux:
+
+   ```sh
+   sudo pacman -S --needed rustup base-devel mpv wl-clipboard   # or xclip on X11
+   rustup default stable
+   ```
+
+   Other distributions: install the same packages with your package manager.
+   `base-devel` (or `build-essential`) is needed because the TLS library
+   compiles C code.
 
 2. Install streamtui. Either let cargo build it into `~/.cargo/bin`:
 
@@ -28,17 +44,24 @@ proxy in front of the CDN so the API key never reaches mpv.
    cargo install --git https://github.com/mhensberg2003/streamtui
    ```
 
-   or clone it and install the binary system-wide:
+   Make sure `~/.cargo/bin` is on your `PATH` (rustup adds it on macOS; on
+   Arch, add `export PATH="$HOME/.cargo/bin:$PATH"` to your shell profile).
+
+   Or clone it and install the binary system-wide:
 
    ```sh
    git clone https://github.com/mhensberg2003/streamtui
    cd streamtui
    cargo build --release
-   sudo install -S -m 755 target/release/streamtui /usr/local/bin/streamtui
+   sudo install -S -m 755 target/release/streamtui /usr/local/bin/streamtui   # macOS
+   sudo install -m 755 target/release/streamtui /usr/local/bin/streamtui      # Linux
    ```
 
-   Use `install -S` for updates too: it replaces the executable atomically,
-   avoiding macOS code-signing cache failures from overwriting it in place.
+   On macOS, use `install -S` for updates too: it replaces the executable
+   atomically, avoiding code-signing cache failures from overwriting it in
+   place. Leave it out on Linux: there `-S` sets a backup suffix, and GNU
+   `install` removes the old file before it copies, so updates are safe
+   without it.
 
 3. Store your TorBox API key:
 
@@ -58,7 +81,9 @@ streamtui --set-key             # store the API key and exit
 ```
 
 The key comes from `TORBOX_API_KEY` if set, otherwise
-`$XDG_CONFIG_HOME/streamtui/config.toml` (written `0600`).
+`streamtui/config.toml` (written `0600`) under `$XDG_CONFIG_HOME`. When that is
+not set, the default is `~/.config` on Linux and `~/Library/Application Support`
+on macOS.
 
 ## Keys
 
