@@ -8,15 +8,46 @@ proxy in front of the CDN so the API key never reaches mpv.
 
 ## Requirements
 
-- mpv on `PATH`
-- A TorBox API key
+- macOS
+- [Rust](https://rustup.rs) 1.85 or later (the crate uses edition 2024)
+- [mpv](https://mpv.io) on `PATH`
+- A [TorBox](https://torbox.app) API key (Settings → API Key)
 
 ## Install
 
-```sh
-cargo build --release
-cp target/release/streamtui /usr/local/bin/
-```
+1. Install Rust and mpv:
+
+   ```sh
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   brew install mpv
+   ```
+
+2. Install streamtui. Either let cargo build it into `~/.cargo/bin`:
+
+   ```sh
+   cargo install --git https://github.com/mhensberg2003/streamtui
+   ```
+
+   or clone it and install the binary system-wide:
+
+   ```sh
+   git clone https://github.com/mhensberg2003/streamtui
+   cd streamtui
+   cargo build --release
+   sudo install -S -m 755 target/release/streamtui /usr/local/bin/streamtui
+   ```
+
+   Use `install -S` for updates too: it replaces the executable atomically,
+   avoiding macOS code-signing cache failures from overwriting it in place.
+
+3. Store your TorBox API key:
+
+   ```sh
+   streamtui --set-key
+   ```
+
+To update, run the same install command again (add `--force` to
+`cargo install`, or `git pull` first when building from a clone).
 
 ## Use
 
@@ -35,6 +66,8 @@ The key comes from `TORBOX_API_KEY` if set, otherwise
 |---|---|
 | `enter` | submit magnet / play selected file |
 | `↑ ↓` `j k` | move selection |
+| `tab` `shift+tab` | switch session (needs two or more) |
+| `x` | close the session |
 | `n` | new magnet |
 | `ctrl+v` | paste from the clipboard |
 | `y` `n` | answer the "not cached, fetch it?" prompt |
@@ -53,14 +86,37 @@ background job — the TUI stays live and you can paste another magnet meanwhile
 Progress polls `mylist?bypass_cache=true` every 2s for the first 30s, then every
 10s. Without `bypass_cache` the server's answer is up to 600 seconds stale.
 
+**Sessions**: every magnet you paste opens a session, and they all stay open.
+`tab` walks the ring of them — from the file list or from the magnet entry
+field — so you can queue an uncached fetch, watch something cached while it
+runs, and come back. Each session keeps its own cursor. A tab strip appears
+under the title once there is more than one, with
+`⟳` on the ones still fetching. Re-pasting a magnet you already hold switches
+to its session instead of starting over. `x` closes a tab — the torrent stays
+in your TorBox account, only the tab goes.
+
+Sessions outlive the process. They are written to `sessions.json` beside
+`config.toml` (also `0600` — a list of magnets says what you watch), and come
+back on the next launch with their file lists, torrent ids and cursor. Restored
+tabs are playable straight away, with no API round trip. The 20 most recent are
+kept; a missing, corrupt or older file is discarded silently rather than
+failing startup.
+
 **Playback**: mpv is handed `http://127.0.0.1:<port>/stream/<token>`. The proxy
 forwards `Range` and `If-Range` verbatim, so mpv seeks natively against the CDN
 and does its own readahead — there is no buffering layer of our own. mpv runs
 with `--no-terminal` and its stdio on `/dev/null`, because ratatui owns the tty.
 An `--input-ipc-server` socket is opened but unused, ready for playback state.
 
+The proxy caches each file's CDN URL in memory for two hours, so seeks and
+track switches reuse it without another TorBox API lookup. Concurrent requests
+share one lookup per file. A CDN 401, 403, or 410 triggers one URL refresh and
+retry; downloaded media bytes are not cached.
+
 Torrents stay in your TorBox account after playback, keeping rewatches instant.
 
 ## Not in v1
 
-Watch history, resume position, library management, P2P fallback.
+Watch history, resume position, library management, P2P fallback. A restored
+session trusts its saved torrent id: if you removed the torrent from TorBox
+between runs, playback fails rather than re-adding it.

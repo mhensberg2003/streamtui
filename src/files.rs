@@ -1,12 +1,14 @@
 //! Video-file filtering for torrent contents.
 
+use serde::{Deserialize, Serialize};
+
 const VIDEO_EXTENSIONS: &[&str] =
     &["mkv", "mp4", "avi", "mov", "webm", "m4v", "ts", "m2ts", "mpg", "mpeg", "wmv", "flv"];
 
 /// Files below this are trailers, samples and stray artwork, not the feature.
 const MIN_SIZE_BYTES: u64 = 50 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentFile {
     /// TorBox file id. None until the torrent exists in the account.
     pub id: Option<i64>,

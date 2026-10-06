@@ -10,6 +10,7 @@ mod files;
 mod magnet;
 mod player;
 mod proxy;
+mod store;
 mod torbox;
 mod ui;
 
@@ -81,6 +82,7 @@ async fn main() -> Result<()> {
     }
 
     let mut app = App::new(torbox, proxy, job_tx);
+    app.restore();
     if let Some(magnet) = args.magnet.or_else(app::read_clipboard) {
         app.input = magnet;
         app.handle(Input::Key(key_event(ratatui::crossterm::event::KeyCode::Enter)));

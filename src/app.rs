@@ -4,11 +4,13 @@ use crate::files::{self, TorrentFile};
 use crate::magnet;
 use crate::player::{self, Playing};
 use crate::proxy::ProxyHandle;
+use crate::store;
 use crate::torbox::Torbox;
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -35,7 +37,7 @@ pub enum Input {
     Tick,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Mode {
     /// Typing or pasting a magnet.
     Entry,
@@ -54,6 +56,44 @@ pub struct Session {
     /// False when the video filter was empty and we fell back to showing all.
     pub filtered: bool,
     pub ready: bool,
+    /// Cursor, held per session so switching away and back keeps your place.
+    pub list: ListState,
+}
+
+impl Session {
+    fn new(name: String, uri: String, files: Vec<TorrentFile>, filtered: bool) -> Self {
+        Self {
+            name,
+            uri,
+            torrent_id: None,
+            files,
+            filtered,
+            ready: false,
+            list: ListState::default().with_selected(Some(0)),
+        }
+    }
+
+    /// Keeps the cursor inside the list after the file set changes.
+    fn clamp_selection(&mut self) {
+        if self.files.is_empty() {
+            self.list.select(None);
+            return;
+        }
+        let index = self.list.selected().unwrap_or(0).min(self.files.len() - 1);
+        self.list.select(Some(index));
+    }
+
+    /// One line describing where this session stands, for the status bar.
+    fn summary(&self, fetching: Option<f64>) -> String {
+        if let Some(progress) = fetching {
+            return format!("{} — fetching, {:.0}%", self.name, progress * 100.0);
+        }
+        if self.filtered {
+            format!("{} — {} video file(s)", self.name, self.files.len())
+        } else {
+            format!("{} — no video files matched, showing everything", self.name)
+        }
+    }
 }
 
 pub struct Pending {
@@ -67,8 +107,10 @@ pub struct App {
     pub input: String,
     pub status: String,
     pub error: Option<String>,
-    pub list: ListState,
     pub sessions: HashMap<String, Session>,
+    /// Hashes in the order their sessions first appeared. `sessions` is keyed
+    /// for lookup; this is what gives tab-switching a stable, predictable ring.
+    pub order: Vec<String>,
     pub current: Option<String>,
     pub pending: HashMap<String, Pending>,
     pub playing: Vec<Playing>,
@@ -80,6 +122,9 @@ pub struct App {
     torbox: Torbox,
     proxy: ProxyHandle,
     tx: UnboundedSender<Job>,
+    /// Where the session list lives. None disables persistence entirely,
+    /// which is what the tests use to keep off the real file.
+    store_path: Option<PathBuf>,
 }
 
 impl App {
@@ -89,8 +134,8 @@ impl App {
             input: String::new(),
             status: "paste a magnet link and press Enter".into(),
             error: None,
-            list: ListState::default(),
             sessions: HashMap::new(),
+            order: Vec::new(),
             current: None,
             pending: HashMap::new(),
             playing: Vec::new(),
@@ -100,11 +145,126 @@ impl App {
             torbox,
             proxy,
             tx,
+            store_path: store::path().ok(),
+        }
+    }
+
+    /// Brings back the sessions from the last run. Their torrent and file ids
+    /// are kept, so a restored tab is playable without another API round trip.
+    pub fn restore(&mut self) {
+        let Some(path) = self.store_path.clone() else { return };
+        let stored = store::load(&path);
+        for saved in stored.sessions.into_iter().take(store::MAX_SESSIONS) {
+            let mut session = Session::new(saved.name, saved.uri, saved.files, saved.filtered);
+            session.torrent_id = saved.torrent_id;
+            session.ready = saved.ready;
+            session.list.select(Some(saved.selected));
+            session.clamp_selection();
+            self.order.push(saved.hash.clone());
+            self.sessions.insert(saved.hash, session);
+        }
+        let focus = stored
+            .current
+            .filter(|hash| self.sessions.contains_key(hash))
+            .or_else(|| self.order.first().cloned());
+        if let Some(hash) = focus {
+            self.focus(hash);
+        }
+    }
+
+    /// Writes the session list out. Called whenever the set or the focus
+    /// changes — never on fetch progress, which ticks every two seconds.
+    fn persist(&mut self) {
+        let sessions = self
+            .order
+            .iter()
+            .rev()
+            .take(store::MAX_SESSIONS)
+            .filter_map(|hash| {
+                let session = self.sessions.get(hash)?;
+                Some(store::StoredSession {
+                    hash: hash.clone(),
+                    uri: session.uri.clone(),
+                    name: session.name.clone(),
+                    torrent_id: session.torrent_id,
+                    files: session.files.clone(),
+                    filtered: session.filtered,
+                    ready: session.ready,
+                    selected: session.list.selected().unwrap_or(0),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let Some(path) = self.store_path.clone() else { return };
+        let stored = store::Stored::new(self.current.clone(), sessions);
+        if let Err(err) = store::save(&path, &stored) {
+            self.error = Some(format!("cannot save the session list: {err}"));
         }
     }
 
     pub fn session(&self) -> Option<&Session> {
         self.current.as_ref().and_then(|hash| self.sessions.get(hash))
+    }
+
+    fn session_mut(&mut self) -> Option<&mut Session> {
+        let hash = self.current.clone()?;
+        self.sessions.get_mut(&hash)
+    }
+
+    /// Moves focus `delta` sessions along the ring, wrapping at both ends.
+    fn switch(&mut self, delta: isize) {
+        if self.order.is_empty() {
+            return;
+        }
+        // Say why nothing moved, rather than swallowing the key.
+        if self.order.len() == 1 {
+            self.status = "only one session — press n to open another magnet".into();
+            return;
+        }
+        let position = self
+            .current
+            .as_ref()
+            .and_then(|hash| self.order.iter().position(|other| other == hash))
+            .unwrap_or(0) as isize;
+        let count = self.order.len() as isize;
+        let next = (position + delta).rem_euclid(count) as usize;
+        self.focus(self.order[next].clone());
+    }
+
+    /// Drops the focused session from the list. The torrent stays in your
+    /// TorBox account — this closes the tab, it does not delete anything.
+    fn close_current(&mut self) {
+        let Some(hash) = self.current.clone() else { return };
+        let Some(position) = self.order.iter().position(|other| *other == hash) else { return };
+        self.order.remove(position);
+        self.sessions.remove(&hash);
+        self.pending.remove(&hash);
+        self.queued_play.remove(&hash);
+
+        // Fall back to the tab on the left, the way a browser does.
+        match self.order.get(position.saturating_sub(1)).cloned() {
+            Some(next) => self.focus(next),
+            None => {
+                self.current = None;
+                self.mode = Mode::Entry;
+                self.input.clear();
+                self.status = "no sessions left — paste a magnet link".into();
+            }
+        }
+        self.persist();
+    }
+
+    /// Shows `hash` and reports what state it is in — a session reached by
+    /// switching may still be fetching, or may have finished while hidden.
+    fn focus(&mut self, hash: String) {
+        let fetching = self.pending.get(&hash).map(|p| p.progress);
+        let Some(session) = self.sessions.get_mut(&hash) else { return };
+        session.clamp_selection();
+        self.status = session.summary(fetching);
+        self.current = Some(hash);
+        self.mode = Mode::Browse;
     }
 
     pub fn handle(&mut self, input: Input) {
@@ -150,6 +310,10 @@ impl App {
                     None => self.status = "clipboard holds no magnet link".into(),
                 }
             }
+            // Entry is an overlay over the sessions, so switching from it is
+            // what you want — typing a magnet is not a reason to be stuck here.
+            KeyCode::Tab => self.switch(1),
+            KeyCode::BackTab => self.switch(-1),
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::Backspace => {
                 self.input.pop();
@@ -175,6 +339,9 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Tab => self.switch(1),
+            KeyCode::BackTab => self.switch(-1),
+            KeyCode::Char('x') => self.close_current(),
             KeyCode::Enter => self.play_selected(),
             _ => {}
         }
@@ -205,13 +372,14 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let Some(count) = self.session().map(|s| s.files.len()) else { return };
+        let Some(session) = self.session_mut() else { return };
+        let count = session.files.len();
         if count == 0 {
             return;
         }
-        let current = self.list.selected().unwrap_or(0) as isize;
+        let current = session.list.selected().unwrap_or(0) as isize;
         let next = (current + delta).clamp(0, count as isize - 1);
-        self.list.select(Some(next as usize));
+        session.list.select(Some(next as usize));
     }
 
     fn request_quit(&mut self) {
@@ -319,24 +487,38 @@ impl App {
         match job {
             Job::Checked { hash, uri, name, files, cached } => {
                 let (display, filtered) = files::filter_videos(&files);
-                self.sessions.insert(
-                    hash.clone(),
-                    Session { name: name.clone(), uri, torrent_id: None, files: display, filtered, ready: false },
-                );
-                self.current = Some(hash);
-                if cached {
-                    self.mode = Mode::Browse;
-                    self.list.select(Some(0));
-                    let session = self.session().expect("just inserted");
-                    self.status = if session.filtered {
-                        format!("{} — {} video file(s)", name, session.files.len())
-                    } else {
-                        format!("{name} — no video files matched, showing everything")
-                    };
+                let ready = match self.sessions.get_mut(&hash) {
+                    // Pasting a magnet we already hold refreshes it in place.
+                    // A ready session keeps its listing: `checkcached` names
+                    // carry no file ids, and overwriting would lose them.
+                    Some(session) => {
+                        session.name = name.clone();
+                        session.uri = uri;
+                        if !session.ready {
+                            session.files = display;
+                            session.filtered = filtered;
+                            session.clamp_selection();
+                        }
+                        session.ready
+                    }
+                    None => {
+                        self.order.push(hash.clone());
+                        self.sessions
+                            .insert(hash.clone(), Session::new(name.clone(), uri, display, filtered));
+                        false
+                    }
+                };
+
+                // An already-downloaded torrent is playable whatever
+                // `checkcached` says, so never re-prompt for one.
+                if cached || ready {
+                    self.focus(hash);
                 } else {
+                    self.current = Some(hash);
                     self.mode = Mode::ConfirmFetch;
                     self.status = format!("{name} is not cached");
                 }
+                self.persist();
             }
             Job::Ready { hash, torrent_id, files } => {
                 self.pending.remove(&hash);
@@ -346,6 +528,7 @@ impl App {
                     session.files = display;
                     session.filtered = filtered;
                     session.ready = true;
+                    session.clamp_selection();
                     session.name.clone()
                 } else {
                     return;
@@ -355,11 +538,13 @@ impl App {
                     self.launch(&hash, &wanted);
                 } else if self.current.as_deref() == Some(hash.as_str()) && self.mode != Mode::Browse {
                     self.mode = Mode::Browse;
-                    self.list.select(Some(0));
                     self.status = format!("{name} — ready");
                 } else if self.current.as_deref() != Some(hash.as_str()) {
-                    self.status = format!("{name} is ready");
+                    // Another session finished; say so without stealing focus.
+                    self.status = format!("{name} is ready — tab to it");
                 }
+                // The ids just learned are what make a restored tab playable.
+                self.persist();
             }
             Job::Progress { hash, progress, state } => {
                 if let Some(pending) = self.pending.get_mut(&hash) {
@@ -373,8 +558,8 @@ impl App {
 
     fn play_selected(&mut self) {
         let Some(hash) = self.current.clone() else { return };
-        let index = self.list.selected().unwrap_or(0);
         let Some(session) = self.sessions.get(&hash) else { return };
+        let index = session.list.selected().unwrap_or(0);
         let Some(file) = session.files.get(index) else {
             self.error = Some("nothing to play".into());
             return;
@@ -427,6 +612,7 @@ impl App {
     }
 
     pub async fn shutdown(&mut self) {
+        self.persist();
         for playing in &mut self.playing {
             playing.kill().await;
         }
@@ -484,4 +670,303 @@ pub fn spawn_key_reader(tx: UnboundedSender<Input>) -> Result<()> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(super) const GB: u64 = 1024 * 1024 * 1024;
+
+    pub(super) async fn test_app() -> App {
+        let torbox = Torbox::new("test-key".into()).unwrap();
+        let proxy = crate::proxy::start(torbox.clone()).await.unwrap();
+        // The receiver is dropped: these tests drive `on_job` directly and
+        // never take the paths that spawn background work.
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(torbox, proxy, tx);
+        // Never touch the real session file from a test.
+        app.store_path = None;
+        app
+    }
+
+    /// An app whose session list lives in a throwaway file.
+    pub(super) async fn stored_app(path: &std::path::Path) -> App {
+        let mut app = test_app().await;
+        app.store_path = Some(path.to_path_buf());
+        app
+    }
+
+    pub(super) fn temp_store(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("streamtui-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("sessions.json")
+    }
+
+    pub(super) fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    pub(super) fn files(names: &[&str]) -> Vec<TorrentFile> {
+        names
+            .iter()
+            .map(|name| TorrentFile { id: None, name: (*name).to_string(), size: GB })
+            .collect()
+    }
+
+    pub(super) fn checked(app: &mut App, hash: &str, name: &str, names: &[&str], cached: bool) {
+        app.on_job(Job::Checked {
+            hash: hash.to_string(),
+            uri: format!("magnet:?xt=urn:btih:{hash}"),
+            name: name.to_string(),
+            files: files(names),
+            cached,
+        });
+    }
+
+    #[tokio::test]
+    async fn tab_cycles_sessions_and_keeps_each_cursor() {
+        let mut app = test_app().await;
+        checked(&mut app, "aaa", "First", &["a1.mkv", "a2.mkv"], true);
+        app.on_key(key(KeyCode::Down));
+        checked(&mut app, "bbb", "Second", &["b1.mkv"], true);
+
+        assert_eq!(app.current.as_deref(), Some("bbb"));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.current.as_deref(), Some("aaa"));
+        assert_eq!(app.session().unwrap().list.selected(), Some(1));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.current.as_deref(), Some("bbb"));
+        assert_eq!(app.session().unwrap().list.selected(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn shift_tab_walks_the_ring_backwards() {
+        let mut app = test_app().await;
+        for hash in ["aaa", "bbb", "ccc"] {
+            checked(&mut app, hash, hash, &["file.mkv"], true);
+        }
+        assert_eq!(app.current.as_deref(), Some("ccc"));
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.current.as_deref(), Some("bbb"));
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.current.as_deref(), Some("aaa"));
+        // Wraps past the start.
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.current.as_deref(), Some("ccc"));
+    }
+
+    #[tokio::test]
+    async fn a_single_session_says_why_tab_does_nothing() {
+        let mut app = test_app().await;
+        checked(&mut app, "aaa", "First", &["a1.mkv"], true);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.current.as_deref(), Some("aaa"));
+        assert_eq!(app.order.len(), 1);
+        assert!(app.status.contains("only one session"), "status was {:?}", app.status);
+    }
+
+    #[tokio::test]
+    async fn tab_works_from_the_magnet_entry_field_too() {
+        let mut app = test_app().await;
+        checked(&mut app, "aaa", "First", &["a1.mkv"], true);
+        checked(&mut app, "bbb", "Second", &["b1.mkv"], true);
+
+        // `n` opens the entry field over the sessions.
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.mode, Mode::Entry);
+
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.current.as_deref(), Some("aaa"));
+    }
+
+    #[tokio::test]
+    async fn tab_is_inert_before_any_session_exists() {
+        let mut app = test_app().await;
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.mode, Mode::Entry);
+        assert!(app.current.is_none());
+    }
+
+    #[tokio::test]
+    async fn playing_a_file_uses_the_focused_session_cursor() {
+        let mut app = test_app().await;
+        checked(&mut app, "aaa", "First", &["a1.mkv", "a2.mkv"], true);
+        app.on_key(key(KeyCode::Down));
+        checked(&mut app, "bbb", "Second", &["b1.mkv"], true);
+        app.on_key(key(KeyCode::Tab));
+        // Not ready, so the pick is queued rather than launched — which is
+        // what tells us which file the cursor resolved to.
+        app.play_selected();
+        assert_eq!(app.queued_play.get("aaa").map(String::as_str), Some("a2.mkv"));
+    }
+
+    #[tokio::test]
+    async fn resubmitting_a_known_magnet_keeps_its_ids_and_tab() {
+        let mut app = test_app().await;
+        checked(&mut app, "aaa", "First", &["a1.mkv"], true);
+        app.on_job(Job::Ready {
+            hash: "aaa".into(),
+            torrent_id: 7,
+            files: vec![TorrentFile { id: Some(3), name: "a1.mkv".into(), size: GB }],
+        });
+
+        // `checkcached` reports names without ids; re-pasting must not lose them.
+        checked(&mut app, "aaa", "First", &["a1.mkv"], true);
+
+        let session = app.session().unwrap();
+        assert_eq!(session.torrent_id, Some(7));
+        assert!(session.ready);
+        assert_eq!(session.files[0].id, Some(3));
+        assert_eq!(app.order, vec!["aaa".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_downloaded_torrent_is_never_offered_for_fetching_again() {
+        let mut app = test_app().await;
+        checked(&mut app, "aaa", "First", &[], false);
+        assert_eq!(app.mode, Mode::ConfirmFetch);
+
+        app.on_job(Job::Ready {
+            hash: "aaa".into(),
+            torrent_id: 7,
+            files: vec![TorrentFile { id: Some(3), name: "a1.mkv".into(), size: GB }],
+        });
+        checked(&mut app, "aaa", "First", &[], false);
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_fetching_session_reports_its_progress() {
+        let mut app = test_app().await;
+        checked(&mut app, "aaa", "First", &[], false);
+        app.pending.insert(
+            "aaa".into(),
+            Pending { name: "First".into(), progress: 0.42, state: "downloading".into() },
+        );
+        checked(&mut app, "bbb", "Second", &["b1.mkv"], true);
+
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.current.as_deref(), Some("aaa"));
+        assert!(app.status.contains("42%"), "status was {:?}", app.status);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::tests::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn sessions_come_back_after_a_restart() {
+        let path = temp_store("restart");
+        {
+            let mut app = stored_app(&path).await;
+            checked(&mut app, "aaa", "First", &["a1.mkv", "a2.mkv"], true);
+            app.on_job(Job::Ready {
+                hash: "aaa".into(),
+                torrent_id: 7,
+                files: vec![TorrentFile { id: Some(3), name: "a1.mkv".into(), size: GB }],
+            });
+            checked(&mut app, "bbb", "Second", &["b1.mkv"], true);
+            app.shutdown().await;
+        }
+
+        let mut next = stored_app(&path).await;
+        next.restore();
+
+        assert_eq!(next.order, vec!["aaa".to_string(), "bbb".to_string()]);
+        assert_eq!(next.mode, Mode::Browse);
+        // The tab that had focus is the one you come back to.
+        assert_eq!(next.current.as_deref(), Some("bbb"));
+
+        let restored = next.sessions.get("aaa").unwrap();
+        assert_eq!(restored.torrent_id, Some(7));
+        assert!(restored.ready);
+        // Ids survive, so a restored tab plays without another API call.
+        assert_eq!(restored.files[0].id, Some(3));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_cursor_position_survives_a_restart() {
+        let path = temp_store("cursor");
+        {
+            let mut app = stored_app(&path).await;
+            checked(&mut app, "aaa", "First", &["a1.mkv", "a2.mkv", "a3.mkv"], true);
+            app.on_key(key(KeyCode::Down));
+            app.on_key(key(KeyCode::Down));
+            app.shutdown().await;
+        }
+
+        let mut next = stored_app(&path).await;
+        next.restore();
+        assert_eq!(next.session().unwrap().list.selected(), Some(2));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_drops_it_from_the_saved_list() {
+        let path = temp_store("close");
+        {
+            let mut app = stored_app(&path).await;
+            checked(&mut app, "aaa", "First", &["a1.mkv"], true);
+            checked(&mut app, "bbb", "Second", &["b1.mkv"], true);
+            app.on_key(key(KeyCode::Char('x')));
+            assert_eq!(app.order, vec!["aaa".to_string()]);
+            // Focus falls back to the neighbour on the left.
+            assert_eq!(app.current.as_deref(), Some("aaa"));
+        }
+
+        let mut next = stored_app(&path).await;
+        next.restore();
+        assert_eq!(next.order, vec!["aaa".to_string()]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_the_last_session_returns_to_the_magnet_field() {
+        let path = temp_store("close-last");
+        let mut app = stored_app(&path).await;
+        checked(&mut app, "aaa", "First", &["a1.mkv"], true);
+        app.on_key(key(KeyCode::Char('x')));
+
+        assert!(app.order.is_empty());
+        assert!(app.current.is_none());
+        assert_eq!(app.mode, Mode::Entry);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_or_missing_file_starts_empty_rather_than_failing() {
+        let path = temp_store("corrupt");
+        let mut app = stored_app(&path).await;
+        // Missing.
+        app.restore();
+        assert!(app.order.is_empty());
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json at all").unwrap();
+        app.restore();
+        assert!(app.order.is_empty());
+
+        // A file from a future version is discarded, not misread.
+        std::fs::write(&path, r#"{"version":99,"sessions":[{"hash":"z","uri":"u","name":"n"}]}"#).unwrap();
+        app.restore();
+        assert!(app.order.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_saved_list_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_store("perms");
+        let mut app = stored_app(&path).await;
+        checked(&mut app, "aaa", "First", &["a1.mkv"], true);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "magnets are a record of what you watch");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 }
